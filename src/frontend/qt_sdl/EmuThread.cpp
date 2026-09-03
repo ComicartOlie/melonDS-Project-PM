@@ -643,7 +643,7 @@ const melonDS::u32 MAXFRAME = 8192;
 // byte after "PLATMP") and sent to the online relay, which refuses to splice a
 // joiner whose version differs from the host's.  ONE constant: the beacon and
 // the relay hello must never disagree.
-const melonDS::u8 WIREVER = 1;
+const melonDS::u8 WIREVER = 2;   // 2 = 8-player rooms (7 peer slots, roles 1..8; ROM protocol v18)
 
 // ---------------------------------------------------------------------------
 // Online relay client (PMRELAY1, contract in tools/relay/RELAY_PROTOCOL.md).
@@ -937,7 +937,7 @@ struct Net
     char joinIP[64] = "127.0.0.1";
     bool started = false;
     SOCKET listener = INVALID_SOCKET;
-    Peer peers[3];                      // host: 3 client slots (slot i = role 2+i)
+    Peer peers[7];                      // host: 7 client slots (slot i = role 2+i; 8-player rooms)
                                         // join: peers[0] = host link
     bool connecting = false;
     bool freshPeer = false;     // link just came up: pump resends on-change
@@ -963,7 +963,7 @@ struct Net
     RelayLink ctl;                      // host control connection
     RelayLink jlink;                    // joiner connection (becomes peers[0])
     struct AcceptLink { RelayLink l; int slot = -1; int ticket = 0; };
-    AcceptLink acc[3];
+    AcceptLink acc[7];
 
     // ---- lobby control frames (shared with the DeSmuME and BizHawk forks) ----
     //   name: [0xFE][role][ping u16 LE][len u8][name]   ping: [0xFD][role][tick u32 LE]
@@ -973,13 +973,13 @@ struct Net
     // known in the lobby, long before anyone activates Wireless Play.
     char myName[24] = "Player";
     bool nameSet = false;
-    char rname[5][24] = {{0}};          // display name by role (1..4)
-    melonDS::u16 rping[5] = {0};        // that role's ping to the host, ms
+    char rname[9][24] = {{0}};          // display name by role (1..8)
+    melonDS::u16 rping[9] = {0};        // that role's ping to the host, ms
     melonDS::u16 myPingMs = 0;
     melonDS::u32 pingSentAt = 0;
     melonDS::u32 pongRx = 0;            // pongs the host answered
     melonDS::u32 lastNameF = 0, lastPingF = 0;
-    melonDS::u32 lobbySeen[5] = {0,0,0,0,0};    // LOBBY presence, by role.
+    melonDS::u32 lobbySeen[9] = {0};    // LOBBY presence, by role.
                                     // Deliberately NOT the ROM-visible peer mask:
                                     // gBr.roleSeenAt stays game-bundle-only, so a
                                     // peer idling in the lobby cannot make the game
@@ -987,8 +987,8 @@ struct Net
                                     // the DeSmuME bridge documents).
 
     int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
-    bool anyUp() const { for (int i=0;i<3;i++) if (peers[i].up) return true; return false; }
-    int upCount() const { int n=0; for (int i=0;i<3;i++) if (peers[i].up) n++; return n; }
+    bool anyUp() const { for (int i=0;i<7;i++) if (peers[i].up) return true; return false; }
+    int upCount() const { int n=0; for (int i=0;i<7;i++) if (peers[i].up) n++; return n; }
 
     void setMsg(const char* m) { setStr(onlineMsg, m); }
 
@@ -1017,7 +1017,7 @@ struct Net
         buf[4] = (melonDS::u8)nl;
         memcpy(buf + 5, myName, nl);
         sendAll(buf, 5 + nl);
-        if (role >= 1 && role <= 4)
+        if (role >= 1 && role <= 8)
         {
             memcpy(rname[role], myName, nl); rname[role][nl] = 0;
             rping[role] = myPingMs;
@@ -1070,7 +1070,7 @@ struct Net
             int r = rx[1];
             melonDS::u16 png = (melonDS::u16)(rx[2] | (rx[3] << 8));
             int nl = rx[4];
-            if (r >= 1 && r <= 4 && nl <= 23 && n >= (melonDS::u32)(5 + nl))
+            if (r >= 1 && r <= 8 && nl <= 23 && n >= (melonDS::u32)(5 + nl))
             {
                 bool isNew = (lobbySeen[r] == 0) || strncmp(rname[r], (const char*)rx + 5, nl) != 0;
                 memcpy(rname[r], rx + 5, nl); rname[r][nl] = 0;
@@ -1084,7 +1084,7 @@ struct Net
                 // Host relay: a client's name reaches only us, so pass it on or
                 // the other clients never learn who else is in the room.
                 if (myRole() == 1)
-                    for (int pj = 0; pj < 3; pj++)
+                    for (int pj = 0; pj < 7; pj++)
                         if (pj != pi) enqueue(pj, rx, n);
             }
             return true;
@@ -1129,7 +1129,7 @@ struct Net
     // fresh across reconnects without any join/leave bookkeeping.
     void lobbyTick(melonDS::u32 frame)
     {
-        for (int i = 0; i < 3; i++) drainControl(i);
+        for (int i = 0; i < 7; i++) drainControl(i);
         if (!anyUp()) return;
         if ((mode == 1 || assignedRole) && frame - lastNameF >= 30)
         {
@@ -1347,9 +1347,9 @@ struct Net
     void startAccept(int tid, melonDS::u32 now)
     {
         int slot = -1, ai = -1;
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 7; i++)
             if (!peers[i].up && !peers[i].reserved) { slot = i; break; }
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 7; i++)
             if (acc[i].l.st == RL_DEAD) { ai = i; break; }
         if (slot < 0 || ai < 0)
         {
@@ -1426,7 +1426,7 @@ struct Net
 
     void hostOnlineTick(melonDS::u32 now)
     {
-        for (int i = 0; i < 3; i++) acceptTick(i, now);
+        for (int i = 0; i < 7; i++) acceptTick(i, now);
 
         if (ctl.st == RL_DEAD)
         {
@@ -1580,7 +1580,7 @@ struct Net
                 (online == 1) ? "host" : "join",
                 roomCode[0] ? roomCode : "-", onlineMsg, upCount(), pendRole, pongRx);
             printf("[BR] lobby roster (me = role %d):", myRole());
-            for (int r = 1; r <= 4; r++)
+            for (int r = 1; r <= 8; r++)
                 if (rname[r][0]) printf(" [%d]\"%s\" %ums", r, rname[r], rping[r]);
             printf("\n");
             fflush(stdout);
@@ -1599,7 +1599,7 @@ struct Net
         setStr(gUiStatus.server, relaySrv);
         setStr(gUiStatus.text, onlineMsg);
         gUiStatus.myRole = myRole();
-        for (int r = 1; r <= 4; r++)
+        for (int r = 1; r <= 8; r++)
         {
             setStr(gUiStatus.roster[r], rname[r]);
             gUiStatus.rosterPing[r] = rping[r];
@@ -1636,7 +1636,7 @@ struct Net
         if (online) onlineTick();
         else if (mode == 1 && listener != INVALID_SOCKET)
         {
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < 7; i++)
             {
                 if (peers[i].up) continue;
                 SOCKET s = accept(listener, NULL, NULL);
@@ -1674,7 +1674,7 @@ struct Net
                 else { dropPeer(0); retryAt = frame + 120; }
             }
         }
-        for (int i = 0; i < 3; i++) { flush(i); pumpRecv(i); }
+        for (int i = 0; i < 7; i++) { flush(i); pumpRecv(i); }
         lobbyTick(frame);
     }
 
@@ -1688,7 +1688,7 @@ struct Net
         pr.tx.insert(pr.tx.end(), p, p + n);
         flush(i);
     }
-    void sendAll(const melonDS::u8* p, melonDS::u32 n) { for (int i=0;i<3;i++) enqueue(i, p, n); }
+    void sendAll(const melonDS::u8* p, melonDS::u32 n) { for (int i=0;i<7;i++) enqueue(i, p, n); }
 
     void flush(int i)
     {
@@ -1729,11 +1729,11 @@ struct Net
     void shutdown()
     {
         online = 0;                 // before dropPeer: no "redial the room" here
-        for (int i=0;i<3;i++) dropPeer(i);
+        for (int i=0;i<7;i++) dropPeer(i);
         if (beaconTx != INVALID_SOCKET) { closesocket(beaconTx); beaconTx = INVALID_SOCKET; }
         if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
         ctl.close(); jlink.close();
-        for (int i=0;i<3;i++) { acc[i].l.close(); acc[i].slot = -1; acc[i].ticket = 0; }
+        for (int i=0;i<7;i++) { acc[i].l.close(); acc[i].slot = -1; acc[i].ticket = 0; }
         roomCode[0] = 0; onlineFatal = false; onlineRetryMs = 0; codeWait = false;
         assignedRole = 0;
         mode = 0;
@@ -1752,13 +1752,13 @@ struct BridgeSt
     melonDS::u32 blkSize = 0, partySize = 0, pktSize = 0;
     melonDS::u8 beat = 0;
     std::vector<melonDS::u8> lastParty, lastPkt;
-    melonDS::u32 roleSeenAt[5] = {0,0,0,0,0};
+    melonDS::u32 roleSeenAt[9] = {0};
     melonDS::u32 dbgTx = 0, dbgRx = 0, dbgPktTx = 0, dbgPktRx = 0;
 
     melonDS::u8 FreshPeerMask(int myRole) const
     {
         melonDS::u8 m = 0;
-        for (int r = 1; r <= 4; r++)
+        for (int r = 1; r <= 8; r++)
             if (r != myRole && roleSeenAt[r] != 0 && frame - roleSeenAt[r] <= 180)
                 m |= (melonDS::u8)(1 << (r - 1));
         return m;
@@ -1913,8 +1913,8 @@ void BridgePump(melonDS::NDS* nds)
     {
         u8 rx[2100];
         u32 n;
-        static melonDS::u8 sGameEver[5] = {0,0,0,0,0};   // ever game-active latch (strictness)
-        for (int pi = 0; pi < 3; pi++)
+        static melonDS::u8 sGameEver[9] = {0};   // ever game-active latch (strictness)
+        for (int pi = 0; pi < 7; pi++)
         while ((n = mpnet::gNet.recvFrame(pi, rx, sizeof(rx))) > 0)
         {
             gBr.dbgRx++;
@@ -1926,14 +1926,14 @@ void BridgePump(melonDS::NDS* nds)
             if (n < 4) continue;
             int tag = rx[0], r = rx[1];
             u32 sz = (u32)(rx[2] | (rx[3] << 8));
-            if (r < 1 || r > 4 || r == myRole) continue;
+            if (r < 1 || r > 8 || r == myRole) continue;
             if (n < 4 + sz) continue;
 
             // Host relay: a client bundle reaches only the host — forward it to
             // the other clients so everyone sees everyone (origin drops its own
             // echo via r == myRole).
             if (myRole == 1)
-                for (int pj = 0; pj < 3; pj++)
+                for (int pj = 0; pj < 7; pj++)
                     if (pj != pi) mpnet::gNet.enqueue(pj, rx, n);
 
             if (tag >= 1 && tag <= 3)
@@ -1975,7 +1975,7 @@ void BridgePump(melonDS::NDS* nds)
                 // peers freeze their exports and an aging count re-opened
                 // the legacy door exactly while a pair fought (4P bug).
                 int gamePeers = 0;
-                for (int gr = 1; gr <= 4; gr++)
+                for (int gr = 1; gr <= 8; gr++)
                     if (gr != myRole && sGameEver[gr]) gamePeers++;
                 bool strict = (gamePeers >= 2);
                 rx[4 + 0x12] = (melonDS::u8)r;   // stamp playerRole (old-hub duty;
@@ -1992,7 +1992,7 @@ void BridgePump(melonDS::NDS* nds)
                 // peers freeze their exports and an aging count re-opened
                 // the legacy door exactly while a pair fought (4P bug).
                 int gamePeers = 0;
-                for (int gr = 1; gr <= 4; gr++)
+                for (int gr = 1; gr <= 8; gr++)
                     if (gr != myRole && sGameEver[gr]) gamePeers++;
                 bool strict = (gamePeers >= 2);
                 if ((pairRole == 0 && !strict) || r == (int)pairRole)
@@ -2023,7 +2023,7 @@ void BridgePump(melonDS::NDS* nds)
         if (pr != sLastPairRole)
         {
             sLastPairRole = pr;
-            if (pr >= 1 && pr <= 4)
+            if (pr >= 1 && pr <= 8)
             {
                 if (gBr.blkN)
                     memcpy(apPtr(nds, gBr.importBlk), apPtr(nds, gBr.blkN + (pr-1)*gBr.blkSize), gBr.blkSize);

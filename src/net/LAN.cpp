@@ -412,6 +412,13 @@ void LAN::EndSession()
         RemotePeers[i] = nullptr;
     }
 
+    // enet_peer_disconnect only QUEUES the disconnect; destroying the host on
+    // the next line threw it away, so the other side never saw us leave and
+    // our slot sat in its lobby forever ("lobby full" on a rejoin).  Flush the
+    // queued disconnects out before tearing the host down.
+    if (Host)
+        enet_host_flush(Host);
+
     enet_host_destroy(Host);
     Host = nullptr;
     IsHost = false;
@@ -531,21 +538,32 @@ void LAN::ProcessHostEvent(ENetEvent& event)
     {
     case ENET_EVENT_TYPE_CONNECT:
         {
-            if ((NumPlayers >= MaxPlayers) || (NumPlayers >= 16))
+            // Count occupied slots and find the first free one from the
+            // Players[] statuses directly -- NumPlayers is a cache that can
+            // drift (a raced disconnect, a stuck handshake), and trusting it
+            // as a high-water mark handed a SECOND client the same region or
+            // rejected a join while slots were actually free.  The status
+            // array is the single source of truth.
+            int id = 16;
             {
-                // game is full, reject connection
-                enet_peer_disconnect(event.peer, 0);
-                break;
+                Platform::Mutex_Lock(PlayersMutex);
+                int live = 0;
+                for (int i = 0; i < 16; i++)
+                {
+                    if (Players[i].Status != Player_None) live++;
+                    else if (id == 16) id = i;
+                }
+                Platform::Mutex_Unlock(PlayersMutex);
+
+                if (live >= MaxPlayers || live >= 16)
+                {
+                    // game is full, reject connection
+                    enet_peer_disconnect(event.peer, 0);
+                    break;
+                }
             }
 
-            // client connected; assign player number
-
-            int id;
-            for (id = 0; id < 16; id++)
-            {
-                if (id >= NumPlayers) break;
-                if (Players[id].Status == Player_None) break;
-            }
+            // client connected; assign the first free player number
 
             if (id < 16)
             {
@@ -590,15 +608,23 @@ void LAN::ProcessHostEvent(ENetEvent& event)
             Player* player = (Player*)event.peer->data;
             if (!player) break;
 
-            ConnectedBitmask &= ~(1 << player->ID);
+            Platform::Mutex_Lock(PlayersMutex);
 
-            int id = player->ID;
-            RemotePeers[id] = nullptr;
-            ConnectingSince[id] = 0;
+            // Idempotent: the reaper (or a prior duplicate event) may already
+            // have freed this slot.  Only act on a still-occupied one, so we
+            // never double-decrement NumPlayers into a phantom "full" lobby.
+            if (player->Status != Player_None)
+            {
+                int id = player->ID;
+                ConnectedBitmask &= ~(1 << id);
+                RemotePeers[id] = nullptr;
+                ConnectingSince[id] = 0;
+                player->Status = Player_None;
+                if (NumPlayers > 0) NumPlayers--;
+            }
+            event.peer->data = nullptr;
 
-            player->ID = 0;
-            player->Status = Player_None;
-            NumPlayers--;
+            Platform::Mutex_Unlock(PlayersMutex);
 
             // broadcast updated player list
             HostUpdatePlayerList();
@@ -758,6 +784,18 @@ void LAN::ProcessClientEvent(ENetEvent& event)
                         Player* player = &Players[i];
                         if (i == MyPlayer.ID) continue;
                         if (player->Status != Player_Client) continue;
+
+                        // A peer sharing the host's address is on the host's
+                        // machine, where only the host binds kLANPort -- a
+                        // client-to-client connect there lands on the HOST
+                        // instead of the peer and shows up in its lobby as a
+                        // blank ghost that never finishes joining (every extra
+                        // same-machine client spawned two, which is what made
+                        // the 4th join wedge and blocked a 5th).  Peers only
+                        // ever accept a connection at the host anyway (clients
+                        // never listen on kLANPort), so this mesh hop is a
+                        // no-op off localhost and pure harm on it -- skip it.
+                        if (player->Address == HostAddress) continue;
 
                         if (!RemotePeers[i])
                         {
@@ -1029,6 +1067,16 @@ void LAN::Process()
         if (IsHost)
         {
             u32 now = (u32)Platform::GetMSCount();
+            bool reaped = false;
+
+            // Reap slots stuck in the handshake past 10 s (a client that was
+            // CPU-starved, crashed, or reset silently before sending its
+            // PlayerInfo).  A fully-joined client that leaves — cleanly (the
+            // EndSession flush now delivers it) or by crashing (ENet's own
+            // peer timeout) — is handled by the DISCONNECT event, NOT here:
+            // reaping Player_Client on a transient peer state raced that event
+            // and double-freed the slot, which is what desynced NumPlayers and
+            // spawned the blank-name ghosts.
             for (int i = 1; i < 16; i++)
             {
                 if (Players[i].Status != Player_Connecting) continue;
@@ -1038,9 +1086,25 @@ void LAN::Process()
                 if (RemotePeers[i]) { enet_peer_disconnect_now(RemotePeers[i], 0); RemotePeers[i] = nullptr; }
                 Players[i].Status = Player_None;
                 ConnectingSince[i] = 0;
-                if (NumPlayers > 0) NumPlayers--;
                 ConnectedBitmask &= ~(1 << i);
+                reaped = true;
             }
+
+            // NumPlayers is a cache of "how many slots are occupied"; the
+            // Players[] statuses are the truth.  Recompute it from them every
+            // pass so any drift (a double-decrement, a missed increment) self-
+            // heals instead of permanently mis-reading the lobby as full.
+            {
+                int live = 0;
+                for (int i = 0; i < 16; i++)
+                    if (Players[i].Status != Player_None) live++;
+                if (NumPlayers != live) { NumPlayers = live; reaped = true; }
+            }
+
+            // Push the corrected roster so every client's lobby view drops the
+            // ghost too (the reap/recount is silent otherwise).
+            if (reaped)
+                HostUpdatePlayerList();
         }
 
         Platform::Mutex_Unlock(PlayersMutex);

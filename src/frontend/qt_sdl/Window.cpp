@@ -1998,6 +1998,13 @@ void MainWindow::showOnlineStatus()
     {
         onlineStatusDlg = new QDialog(this);
         onlineStatusDlg->setWindowTitle("Online Game");
+        // A parented QDialog has no minimize box and no taskbar entry, so the
+        // online status window could only be closed, never minimized (unlike
+        // the LAN dialog).  Promote it to a real top-level window with the
+        // minimize + close hints so it behaves like every other window.
+        onlineStatusDlg->setWindowFlags(Qt::Window
+            | Qt::CustomizeWindowHint | Qt::WindowTitleHint
+            | Qt::WindowMinimizeButtonHint | Qt::WindowCloseButtonHint);
 
         QVBoxLayout* lay = new QVBoxLayout(onlineStatusDlg);
         onlineStatusLabel = new QLabel("Online - starting...", onlineStatusDlg);
@@ -2068,7 +2075,7 @@ void MainWindow::updateOnlineStatus()
     // Roster: names arrive over the shared lobby frame, so players show up here
     // as soon as they connect, well before anyone starts playing.
     QString roster;
-    for (int r = 1; r <= 4; r++)
+    for (int r = 1; r <= 8; r++)
     {
         if (!st.roster[r][0]) continue;
         roster += QString("\n  %1. %2").arg(r).arg(st.roster[r]);

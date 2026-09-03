@@ -51,10 +51,10 @@ struct MpOnlineStatus
     char server[96] = "";
     char text[128] = "";            // connection state / last error, for the UI
 
-    // Lobby roster, indexed by role 1..4 (slot 0 unused).  Names arrive over
+    // Lobby roster, indexed by role 1..8 (slot 0 unused).  Names arrive over
     // the shared 0xFE frame, so they are known before anyone starts playing.
-    char roster[5][24] = {};
-    int rosterPing[5] = {};         // that player's ping to the host, ms
+    char roster[9][24] = {};
+    int rosterPing[9] = {};         // that player's ping to the host, ms
     int myRole = 0;
 };
 
