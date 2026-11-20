@@ -1076,8 +1076,11 @@ struct Net
             if (r >= 1 && r <= 8 && nl <= 23 && n >= (melonDS::u32)(5 + nl)
                 && roleAllowed(pi, r))
             {
-                bool isNew = (lobbySeen[r] == 0) || strncmp(rname[r], (const char*)rx + 5, nl) != 0;
-                memcpy(rname[r], rx + 5, nl); rname[r][nl] = 0;
+                // names come from other machines: blank out control characters
+                char nm[24]; memcpy(nm, rx + 5, nl); nm[nl] = 0;
+                for (char* c = nm; *c; c++) if ((unsigned char)*c < 0x20 || *c == 0x7F) *c = '?';
+                bool isNew = (lobbySeen[r] == 0) || strcmp(rname[r], nm) != 0;
+                memcpy(rname[r], nm, nl + 1);
                 rping[r] = png;
                 lobbySeen[r] = GetTickCount();
                 if (isNew)
