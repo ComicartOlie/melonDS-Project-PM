@@ -575,7 +575,6 @@ melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
 namespace melonDS {
 extern volatile unsigned int g_wifiCrumb;
 extern volatile unsigned int g_wifiCrumbSeq;
-extern volatile unsigned int g_asyncSpin;
 }
 
 // Freeze watchdog: a detached thread (survives an emu-thread hang) that
@@ -601,10 +600,10 @@ static void MpWatchdogStart(const char* role)
                     FILE* f = fopen(name.c_str(), "a");
                     if (f) {
                         // wifiSeq advancing while loop is stuck => spinning
-                        // inside a wifi loop; asyncSpin identifies phase-14
-                        fprintf(f, "STUCK %dms loop=%u wifiCrumb=%u wifiSeq=%u asyncSpin=%u\n",
+                        // inside a wifi loop
+                        fprintf(f, "STUCK %dms loop=%u wifiCrumb=%u wifiSeq=%u\n",
                             stuckMs, loop, melonDS::g_wifiCrumb,
-                            melonDS::g_wifiCrumbSeq, melonDS::g_asyncSpin);
+                            melonDS::g_wifiCrumbSeq);
                         fclose(f);
                     }
                 }
@@ -987,6 +986,8 @@ struct Net
                                     // the DeSmuME bridge documents).
 
     int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
+    // Host: slot i may only speak as role 2+i. Joiners trust the host's relay.
+    bool roleAllowed(int slot, int role) const { return mode != 1 || role == 2 + slot; }
     bool anyUp() const { for (int i=0;i<7;i++) if (peers[i].up) return true; return false; }
     int upCount() const { int n=0; for (int i=0;i<7;i++) if (peers[i].up) n++; return n; }
 
@@ -1042,6 +1043,8 @@ struct Net
     {
         if (n == 2 && rx[0] == 0xFF)                    // host-assigned role
         {
+            // only a joiner takes it, and only from the host link
+            if (mode != 2 || pi != 0 || rx[1] < 2 || rx[1] > 8) return true;
             if (assignedRole != rx[1])
             {
                 printf("[BR] host assigned role %d\n", rx[1]);
@@ -1070,7 +1073,8 @@ struct Net
             int r = rx[1];
             melonDS::u16 png = (melonDS::u16)(rx[2] | (rx[3] << 8));
             int nl = rx[4];
-            if (r >= 1 && r <= 8 && nl <= 23 && n >= (melonDS::u32)(5 + nl))
+            if (r >= 1 && r <= 8 && nl <= 23 && n >= (melonDS::u32)(5 + nl)
+                && roleAllowed(pi, r))
             {
                 bool isNew = (lobbySeen[r] == 0) || strncmp(rname[r], (const char*)rx + 5, nl) != 0;
                 memcpy(rname[r], rx + 5, nl); rname[r][nl] = 0;
@@ -1927,6 +1931,7 @@ void BridgePump(melonDS::NDS* nds)
             int tag = rx[0], r = rx[1];
             u32 sz = (u32)(rx[2] | (rx[3] << 8));
             if (r < 1 || r > 8 || r == myRole) continue;
+            if (!mpnet::gNet.roleAllowed(pi, r)) continue;
             if (n < 4 + sz) continue;
 
             // Host relay: a client bundle reaches only the host — forward it to

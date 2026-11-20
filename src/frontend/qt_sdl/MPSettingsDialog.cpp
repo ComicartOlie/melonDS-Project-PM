@@ -51,7 +51,6 @@ MPSettingsDialog::MPSettingsDialog(QWidget* parent) : QDialog(parent), ui(new Ui
     grpAudioMode->button(cfg.GetInt("MP.AudioMode"))->setChecked(true);
 
     ui->sbReceiveTimeout->setValue(cfg.GetInt("MP.RecvTimeout"));
-    ui->cbAsyncMode->setChecked(cfg.GetBool("MP.AsyncMode"));
 }
 
 MPSettingsDialog::~MPSettingsDialog()
@@ -73,8 +72,6 @@ void MPSettingsDialog::done(int r)
         auto& cfg = emuInstance->getGlobalConfig();
         cfg.SetInt("MP.AudioMode", grpAudioMode->checkedId());
         cfg.SetInt("MP.RecvTimeout", ui->sbReceiveTimeout->value());
-        cfg.SetBool("MP.AsyncMode", ui->cbAsyncMode->isChecked());
-        melonDS::MPInterface::Get().SetAsyncMode(cfg.GetBool("MP.AsyncMode"));
 
         Config::Save();
     }
