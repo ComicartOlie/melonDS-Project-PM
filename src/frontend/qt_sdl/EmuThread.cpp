@@ -119,28 +119,9 @@ void EmuThread::detachWindow(MainWindow* window)
 }
 
 
-// ---------------------------------------------------------------------------
-// Scripted test autopilot + RAM telemetry (debug tooling, env-driven).
-//   MELONDS_AP=host|join      enable; pick LAN role
-//   MELONDS_AP_IP=<ip>        join target (default 127.0.0.1)
-//   MELONDS_AP_NOINPUT=1      transport only: never press a button or activate
-//                             wireless, so the ROM stays at the title screen
-//                             (lobby-level verification)
-// Drives the ROM through boot -> multiplayer activation, runs movement
-// patterns, and logs the game's own view of every player (positions read
-// straight out of emulated main RAM via the ROM's discovery block) to
-// melonds_ap_<role>.csv for offline comparison.  Inert unless the env
-// variable is set.
-// ---------------------------------------------------------------------------
+// Emulated main RAM accessors for the bridge.
 namespace
 {
-
-int apMode = -2;                // -2 uninit, -1 off, 0 host, 1 join
-const char* apJoinIP = "127.0.0.1";
-melonDS::u32 apFrame = 0;
-melonDS::u32 apConnFrame = 0;   // frame the session connected (0 = not yet)
-melonDS::u32 apDiscBase = 0;    // emu-addr of the ROM discovery block
-FILE* apCsv = nullptr;
 
 melonDS::u32 apRd32(melonDS::NDS* nds, melonDS::u32 addr)
 {
@@ -159,518 +140,29 @@ void apWr32(melonDS::NDS* nds, melonDS::u32 addr, melonDS::u32 v)
     *(melonDS::u32*)&nds->MainRAM[addr & nds->MainRAMMask] = v;
 }
 
-// Activate/stop the wireless session via the ROM's debug inbox (sDiscovery[17],
-// cmd 19) — in-game activation moved from the SELECT shortcut to the
-// "Wireless Play" bag item, which an autopilot can't navigate to reliably.
-void apWirelessCtl(melonDS::NDS* nds, melonDS::u32 discBase, int on)
-{
-    if (!discBase) return;
-    melonDS::u32 inbox = apRd32(nds, discBase + 17*4);
-    if (!inbox) return;
-    apWr32(nds, inbox + 12, 19);            // cmd
-    apWr32(nds, inbox + 16, on ? 1 : 0);    // arg[0]
-    apWr32(nds, inbox + 4, apRd32(nds, inbox + 8) + 1);   // seq = ackSeq+1
-}
-
-static volatile unsigned int g_apLoopSeq = 0;   // emu-loop heartbeat
-static int apInField = 0;        // latched once the overworld is running
-static melonDS::u32 apFieldFC = 0;
-
-melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
-{
-    using namespace melonDS;
-    u32 mask = maskIn;
-
-    g_apLoopSeq++;   // RunFrame from the previous iteration returned
-
-    if (apMode == -2)
-    {
-        const char* e = getenv("MELONDS_AP");
-        apMode = (!e) ? -1 : (!strcmp(e, "host")) ? 0 : (!strcmp(e, "join")) ? 1 : -1;
-        const char* ip = getenv("MELONDS_AP_IP");
-        if (ip) apJoinIP = ip;
-    }
-    if (apMode < 0) return mask;
-
-    apFrame++;
-
-    // MELONDS_AP_NOINPUT: bring the transport up but never drive the ROM - no
-    // button presses, no wireless activation, no movement patterns.  Lets a
-    // harness verify the lobby (relay handshake, role assignment, roster) with
-    // the game left sitting at the title screen.
-    static int apNoInput = -1;
-    if (apNoInput < 0) apNoInput = getenv("MELONDS_AP_NOINPUT") ? 1 : 0;
-    if (apNoInput) return mask;
-
-    // ---- transport bring-up ----
-    // The mailbox bridge now rides a direct TCP MpNet (the SAME wire protocol
-    // as the DeSmuME and BizHawk forks), NOT melonDS's ENet LAN — so all three
-    // emulators interoperate in one session.  The TCP transport self-starts
-    // inside BridgePump from the MELONDS_AP env; nothing to do here.
-
-    // ---- input script ----
-    // MELONDS_AP_HOLD: boot to the overworld and start the LAN side, but
-    // do NOT activate in-game multiplayer and run no movement patterns.
-    // Activation fires when a file named "melonds_go.txt" appears in the
-    // working directory (SELECT, then A on "Activate Multiplayer").
-    static int apHold = -1;
-    static melonDS::u32 apGoFrame = 0;
-    if (apHold < 0) apHold = getenv("MELONDS_AP_HOLD") ? 1 : 0;
-
-    u32 press = 0;
-    if (apFrame >= 700 && apFrame < 2000 && !apInField)
-    {
-        if ((apFrame % 40) < 8) press |= (1 << 0);            // tap A (title/file select)
-    }
-    else if (!apHold && apFrame == 2120)
-    {
-        apWirelessCtl(nds, apDiscBase, 1);   // debug-inbox activation (cmd 19)
-    }
-    else if (apHold && apFrame > 2100)
-    {
-        if (!apGoFrame && (apFrame % 30) == 0)
-        {
-            char gn[64]; snprintf(gn, sizeof(gn), "melonds_go_%s.txt", (apMode==0)?"host":"join");
-            FILE* gf = fopen(gn, "r");
-            if (gf)
-            {
-                fclose(gf);
-                remove(gn);   // consume: re-armed for next touch
-                apGoFrame = apFrame;
-            }
-        }
-        if (apGoFrame)
-        {
-            u32 gf = apFrame - apGoFrame;
-            if (gf == 10)        apWirelessCtl(nds, apDiscBase, 1);  // inbox activation
-            else if (gf >= 300)  apGoFrame = 0;                      // re-arm
-        }
-    }
-
-    // ---- discovery scan + telemetry ----
-    if (apFrame >= 600 && apDiscBase == 0 && (apFrame % 60) == 0)
-    {
-        for (u32 off = 0; off < 0x400000 - 16; off += 4)
-        {
-            if (*(u32*)&nds->MainRAM[off] == 0xCAFE1234
-                && *(u32*)&nds->MainRAM[off+4] == 0x5678CAFE)
-            {
-                apDiscBase = 0x02000000 + off;
-                printf("[AP] discovery at %08X\n", apDiscBase);
-                break;
-            }
-        }
-    }
-
-    if (apDiscBase)
-    {
-        u32 pOwExp = apRd32(nds, apDiscBase + 14*4);
-        u32 pOwImp = apRd32(nds, apDiscBase + 15*4);
-        u32 pDiag  = apRd32(nds, apDiscBase + 30*4);
-        u8 wmState = pDiag ? apRd8(nds, pDiag + 4) : 0xFF;
-        u8 peerMask = pDiag ? apRd8(nds, pDiag + 7) : 0;
-
-        // field detection: overworld frameCounter advancing == in-field.
-        // Latches the boot A-mash OFF so it cannot leak into a counter menu.
-        if (!apInField)
-        {
-            u32 fc = apRd32(nds, pOwExp + 0x0C);
-            if (fc != 0 && apFieldFC != 0 && fc != apFieldFC) apInField = 1;
-            apFieldFC = fc;
-        }
-
-        if (!apConnFrame && peerMask) 
-        {
-            apConnFrame = apFrame;
-            printf("[AP] connected at frame %u\n", apFrame);
-        }
-
-        // Remote movement commands (hold mode): a file "melonds_move.txt"
-        // containing tokens like "L1 U20 R3 D2" walks the player tile-
-        // exactly: each token holds its direction until the live grid
-        // coordinate (read from the export block) reaches the target, with
-        // a timeout guard for walls.  File is consumed on pickup.
-        {
-            static char mvSeq[256];
-            static int mvLen = 0, mvPos = 0, mvActive = 0, mvBit = 0;
-            static int mvTX = 0, mvTZ = 0;
-            static int mvMode = 0;      // 0=walk 1=tap 2=wait
-            static int mvTimer = 0;
-            static int mvSprint = 0;
-            static melonDS::u32 mvDeadline = 0;
-
-            if (apFrame > 2100)
-            {
-                int curX = apRd16s(nds, pOwExp + 4);
-                int curZ = apRd16s(nds, pOwExp + 6);
-
-                if ((apFrame % 10) == 0 && (mvActive || mvPos < mvLen))
-                {
-                    // abort: a command file starting with '!' cancels everything
-                    char an[64]; snprintf(an, sizeof(an), "melonds_move_%s.txt", (apMode==0)?"host":"join");
-                    FILE* af = fopen(an, "r");
-                    if (af)
-                    {
-                        int c0 = fgetc(af);
-                        fclose(af);
-                        if (c0 == '!')
-                        {
-                            remove(an);
-                            mvActive = 0; mvLen = 0; mvPos = 0;
-                        }
-                    }
-                }
-                if (!mvActive && mvPos >= mvLen && (apFrame % 10) == 0)
-                {
-                    char mn[64]; snprintf(mn, sizeof(mn), "melonds_move_%s.txt", (apMode==0)?"host":"join");
-                    FILE* mf = fopen(mn, "r");
-                    if (mf)
-                    {
-                        mvLen = (int)fread(mvSeq, 1, 255, mf);
-                        if (mvLen < 0) mvLen = 0;
-                        mvSeq[mvLen] = 0;
-                        fclose(mf);
-                        remove(mn);
-                        mvPos = 0;
-                    }
-                }
-                if (!mvActive && mvPos < mvLen)
-                {
-                    while (mvPos < mvLen && (mvSeq[mvPos] == ' ' || mvSeq[mvPos] == 10 || mvSeq[mvPos] == 13 || mvSeq[mvPos] == 9)) mvPos++;
-                    if (mvPos < mvLen)
-                    {
-                        char d = mvSeq[mvPos++];
-                        int n = 0;
-                        while (mvPos < mvLen && mvSeq[mvPos] >= '0' && mvSeq[mvPos] <= '9') n = n * 10 + (mvSeq[mvPos++] - '0');
-                        char dl = (char)(d | 0x20);
-
-                        if (n == 0 && (dl=='l'||dl=='r'||dl=='u'||dl=='d'))
-                        {
-                            // bare direction = one TAP (face/menu navigation)
-                            switch (dl)
-                            {
-                            case 'l': mvBit = 5; break;
-                            case 'r': mvBit = 4; break;
-                            case 'u': mvBit = 6; break;
-                            default:  mvBit = 7; break;
-                            }
-                            mvMode = 1; mvTimer = 34;
-                            mvActive = 1;
-                        }
-                        else if (n > 0 && (dl=='l'||dl=='r'||dl=='u'||dl=='d'))
-                        {
-                            // movement: uppercase walks, lowercase sprints
-                            mvSprint = (d >= 'a');
-                            mvTX = curX; mvTZ = curZ;
-                            switch (dl)
-                            {
-                            case 'l': mvBit = 5; mvTX = curX - n; break;
-                            case 'r': mvBit = 4; mvTX = curX + n; break;
-                            case 'u': mvBit = 6; mvTZ = curZ - n; break;
-                            default:  mvBit = 7; mvTZ = curZ + n; break;
-                            }
-                            mvDeadline = apFrame + (melonDS::u32)n * 60 + 240;
-                            mvMode = 0;
-                            mvActive = 1;
-                        }
-                        else if (dl=='w' && n > 0)
-                        {
-                            mvMode = 2; mvTimer = n; mvActive = 1;
-                        }
-                        else if (dl=='a'||dl=='b'||dl=='x'||dl=='y'||dl=='s'||dl=='c')
-                        {
-                            // button tap: A B X Y S(tart) C(select)
-                            switch (dl)
-                            {
-                            case 'a': mvBit = 0; break;
-                            case 'b': mvBit = 1; break;
-                            case 'c': mvBit = 2; break;
-                            case 's': mvBit = 3; break;
-                            case 'x': mvBit = 10; break;
-                            default:  mvBit = 11; break;
-                            }
-                            mvMode = 1; mvTimer = 40;   // 12f press + gap
-                            mvActive = 1;
-                        }
-                    }
-                }
-                if (mvActive)
-                {
-                    if (mvMode == 0)
-                    {
-                        int done = (apFrame > mvDeadline)
-                            || (mvBit == 5 && curX <= mvTX) || (mvBit == 4 && curX >= mvTX)
-                            || (mvBit == 6 && curZ <= mvTZ) || (mvBit == 7 && curZ >= mvTZ);
-                        if (done) mvActive = 0;
-                        else
-                        {
-                            press |= (1u << mvBit);
-                            if (mvSprint) press |= (1u << 1);
-                        }
-                    }
-                    else if (mvMode == 1)
-                    {
-                        if (mvTimer > 28) press |= (1u << mvBit);   // first 12f pressed
-                        if (--mvTimer <= 0) mvActive = 0;
-                    }
-                    else
-                    {
-                        if (--mvTimer <= 0) mvActive = 0;
-                    }
-                }
-            }
-        }
-
-        // movement phases relative to connect.
-        // MELONDS_AP_PATTERN selects the stress pattern:
-        //   (unset)/walk : hold a direction, alternating every 90f
-        //   run          : same, with B held (sprint — double tile rate)
-        //   circle       : B held, cycle RIGHT->DOWN->LEFT->UP every 32f
-        //                  (running in a loop: direction-change stress)
-        if (apConnFrame && !apHold)
-        {
-            static int patMode = -1;
-            if (patMode < 0)
-            {
-                const char* pat = getenv("MELONDS_AP_PATTERN");
-                patMode = (!pat) ? 0 : (!strcmp(pat, "run")) ? 1
-                        : (!strcmp(pat, "circle")) ? 2
-                        : (!strcmp(pat, "waggle")) ? 3
-                        : (!strcmp(pat, "ugclient")) ? 4
-                        : (!strcmp(pat, "ughost")) ? 5 : 0;
-            }
-            u32 cf = apFrame - apConnFrame;
-            u32 winLo = (apMode == 0) ? 300u : 1700u;
-            u32 winHi = (apMode == 0) ? 1500u : 2900u;
-
-            if (patMode >= 4)
-            {
-                // Underground leave/re-enter repro (the user's manual recipe):
-                //   both: Y (registered Explorer Kit) then A every 1s x30 -> descend
-                //   leaver only: X menu, Down x5, A x4 (2s apart) -> "Go up"
-                //   wait ~15s, then Y + A every 1s x30 -> descend again
-                // ugclient: the JOIN instance leaves; ughost: the HOST leaves.
-                bool leaver = (patMode == 4) ? (apMode == 1) : (apMode == 0);
-                // 4-player runs: several instances share apMode=join, but only
-                // ONE should exercise the leave/re-enter arc.  Extra joiners
-                // set MELONDS_AP_NOLEAVE=1 and just descend + stand.
-                static int apNoLeave = -1;
-                if (apNoLeave < 0) apNoLeave = getenv("MELONDS_AP_NOLEAVE") ? 1 : 0;
-                if (apNoLeave) leaver = false;
-
-                if (cf >= 300 && cf < 308)
-                    press |= (1u << 11);                                   // Y: Explorer Kit
-                else if (cf >= 360 && cf < 360 + 30*60 && ((cf - 360) % 60) < 8)
-                    press |= (1u << 0);                                    // A x30 (1/s)
-
-                if (leaver)
-                {
-                    const u32 L = 2400;                                    // below by now
-                    const u32 R = L + 240 + 4*120 + 900;                   // after up + ~15s
-                    if (cf >= L && cf < L + 8)
-                        press |= (1u << 10);                               // X: menu
-                    else if (cf >= L + 60 && cf < L + 60 + 5*24 && ((cf - L - 60) % 24) < 8)
-                        press |= (1u << 7);                                // Down x5
-                    else if (cf >= L + 240 && cf < L + 240 + 4*120 && ((cf - L - 240) % 120) < 8)
-                        press |= (1u << 0);                                // A x4 (2s apart)
-                    else if (cf >= R && cf < R + 8)
-                        press |= (1u << 11);                               // Y again
-                    else if (cf >= R + 60 && cf < R + 60 + 30*60 && ((cf - R - 60) % 60) < 8)
-                        press |= (1u << 0);                                // A x30: re-descend
-                }
-            }
-            else if (cf >= winLo && cf < winHi)
-            {
-                if (patMode == 3)
-                {
-                    // waggle: sprint direction-flips every 8f (240f), then a
-                    // sustained sprint (180f, direction alternates per cycle),
-                    // then a full stop (90f); repeat.  Host on the L/R axis,
-                    // join on U/D.
-                    u32 pc = (cf - winLo) % 510;
-                    int bitA = (apMode == 0) ? 5 : 6;   // LEFT / UP
-                    int bitB = (apMode == 0) ? 4 : 7;   // RIGHT / DOWN
-                    if (pc < 240)
-                    {
-                        press |= (1 << 1);
-                        press |= (1 << (((pc / 8) & 1) ? bitA : bitB));
-                    }
-                    else if (pc < 420)
-                    {
-                        press |= (1 << 1);
-                        press |= (1 << ((((cf - winLo) / 510) & 1) ? bitB : bitA));
-                    }
-                    // else: stopped
-                }
-                else if (patMode == 2)
-                {
-                    static const int circleBit[4] = { 4, 7, 5, 6 };  // R,D,L,U
-                    press |= (1 << 1);                               // B: run
-                    press |= (1 << circleBit[(cf / 32) & 3]);
-                }
-                else
-                {
-                    if (patMode == 1)
-                        press |= (1 << 1);                           // B: run
-                    if (apMode == 0)
-                        press |= (1 << (((cf / 90) & 1) ? 5 : 4));   // RIGHT/LEFT
-                    else
-                        press |= (1 << (((cf / 90) & 1) ? 7 : 6));   // UP/DOWN
-                }
-            }
-        }
-
-        // GAME-HANG PC SAMPLER: if the game's own frame counter stops
-        // advancing while connected, the ARM9 is wedged (emulator still
-        // fine).  Sample R15/R14 for 32 frames and dump — the exact hang
-        // site, resolvable against the linker map.
-        {
-            static u32 lastFC = 0, lastChangeAt = 0, dumped = 0;
-            u32 fcNow = apRd32(nds, pOwExp + 0x0C);
-            if (fcNow != lastFC) { lastFC = fcNow; lastChangeAt = apFrame; dumped = 0; }
-            else if (apConnFrame && apFrame - lastChangeAt > 180 && dumped < 64)
-            {
-                char hn[64];
-                snprintf(hn, sizeof(hn), "melonds_hangpc_%s.txt", (apMode==0)?"host":"join");
-                FILE* hf = fopen(hn, "a");
-                if (hf)
-                {
-                    fprintf(hf, "f=%u FCstuck=%u R15=%08X R14=%08X R13=%08X R12=%08X CPSR=%08X IE=%08X IF=%08X IME=%u\n",
-                        apFrame, fcNow,
-                        nds->ARM9.R[15], nds->ARM9.R[14], nds->ARM9.R[13], nds->ARM9.R[12],
-                        nds->ARM9.CPSR, nds->IE[0], nds->IF[0], (unsigned)nds->IME[0]);
-                    fclose(hf);
-                    dumped++;
-                }
-            }
-        }
-
-        if (!apCsv)
-        {
-            char name[64];
-            snprintf(name, sizeof(name), "melonds_ap_%s.csv", (apMode == 0) ? "host" : "join");
-            apCsv = fopen(name, "w");
-            if (apCsv) fprintf(apCsv, "frame,wmState,peerMask,ownX,ownZ,ownFC,i0X,i0Z,i0FC,i1X,i1Z,i1FC,epoch,bumps,rew,recOw,recBlk,recParty,recPkt,lastSrcType,ovf,gaps,subf,rxqd,pexp,pcontig,bcnCalls,bcnApplies,bcnSeq,txF,rxF\n");
-        }
-        if (apCsv && pOwExp && pOwImp)
-        {
-            fprintf(apCsv, "%u,%u,%u,%d,%d,%u,%d,%d,%u,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
-                apFrame, wmState, peerMask,
-                apRd16s(nds, pOwExp+4), apRd16s(nds, pOwExp+6), apRd32(nds, pOwExp+0x0C),
-                apRd16s(nds, pOwImp+4), apRd16s(nds, pOwImp+6), apRd32(nds, pOwImp+0x0C),
-                apRd16s(nds, pOwImp+48+4), apRd16s(nds, pOwImp+48+6), apRd32(nds, pOwImp+48+0x0C),
-                apRd8(nds, pDiag+8), apRd8(nds, pDiag+40), apRd32(nds, pDiag+28),
-                apRd8(nds, pDiag+36), apRd8(nds, pDiag+37), apRd8(nds, pDiag+38), apRd8(nds, pDiag+39),
-                apRd8(nds, pDiag+41), apRd8(nds, pDiag+11), apRd8(nds, pDiag+42), apRd8(nds, pDiag+43), apRd8(nds, pDiag+44), (apRd32(nds, pDiag+32)>>16)&0xFFFF, apRd32(nds, pDiag+32)&0xFFFF, apRd8(nds, pDiag+45), apRd8(nds, pDiag+46), apRd8(nds, pDiag+47), apRd32(nds, pDiag+12), apRd32(nds, pDiag+16));
-            if ((apFrame & 255) == 0) fflush(apCsv);
-        }
-    }
-
-    return mask & ~press;
-}
-
-}
-// ---------------------------------------------------------------------------
-
-namespace melonDS {
-extern volatile unsigned int g_wifiCrumb;
-extern volatile unsigned int g_wifiCrumbSeq;
-}
-
-// Freeze watchdog: a detached thread (survives an emu-thread hang) that
-// records the last wifi breadcrumb whenever the emu thread stops making
-// progress.  Enabled by MELONDS_AP (autopilot) so normal runs pay nothing.
-static void MpWatchdogStart(const char* role)
-{
-    std::string r = role;
-    std::thread([r]() {
-        std::string name = "melonds_watchdog_" + r + ".txt";
-        unsigned int lastLoop = 0;
-        int stuckMs = 0;
-        for (;;)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            unsigned int loop = g_apLoopSeq;
-            if (loop == lastLoop)
-            {
-                // emu loop has not advanced a frame: RunFrame is wedged.
-                stuckMs += 200;
-                if (stuckMs == 1000 || stuckMs == 4000 || stuckMs == 12000)
-                {
-                    FILE* f = fopen(name.c_str(), "a");
-                    if (f) {
-                        // wifiSeq advancing while loop is stuck => spinning
-                        // inside a wifi loop
-                        fprintf(f, "STUCK %dms loop=%u wifiCrumb=%u wifiSeq=%u\n",
-                            stuckMs, loop, melonDS::g_wifiCrumb,
-                            melonDS::g_wifiCrumbSeq);
-                        fclose(f);
-                    }
-                }
-            }
-            else { stuckMs = 0; lastLoop = loop; }
-        }
-    }).detach();
 }
 
 
-// ---------------------------------------------------------------------------
-// Fork-embedded mailbox bridge.  When the loaded ROM publishes the bridge
-// control block (discovery slot 31) and the player has a LAN session, the
-// ROM's field menu can request a bridge session: this pump then syncs the
-// ROM's multiplayer mailboxes across the LAN link at frame rate (reliable
-// ENet channel, packet type 4).  The emulated radio is never touched, so
-// native wireless features keep full ownership of it.
-// ---------------------------------------------------------------------------
+// Mailbox bridge: syncs the ROM's multiplayer mailboxes between players each frame; the emulated radio is never touched.
 namespace
 {
 
-// ---------------------------------------------------------------------------
-// Cross-emulator TCP transport.  Identical wire protocol to the DeSmuME and
-// BizHawk forks — [u16 len LE][tag u8][role u8][size u16 LE][payload], plus a
-// [len=2][0xFF][role] control frame the host sends to assign each joiner its
-// role — so a melonDS host/joiner interoperates with DeSmuME and BizHawk
-// instances in the same session.  Host listens :7820 and relays; joiners
-// connect.  Non-blocking; drained once per frame from BridgePump.
-// ---------------------------------------------------------------------------
+// Cross-emulator TCP transport (host listens :7820). Frame = [u16 len LE][tag u8][role u8][size u16 LE][payload].
 namespace mpnet
 {
 const int PORT = 7820;
 const melonDS::u32 MAXFRAME = 8192;
 
-// Bridge wire protocol version.  Advertised by the LAN discovery beacon (the
-// byte after "PLATMP") and sent to the online relay, which refuses to splice a
-// joiner whose version differs from the host's.  ONE constant: the beacon and
-// the relay hello must never disagree.
+// Wire version: the LAN beacon byte and the relay hello must always match.
 const melonDS::u8 WIREVER = 2;   // 2 = 8-player rooms (7 peer slots, roles 1..8; ROM protocol v18)
 
-// ---------------------------------------------------------------------------
-// Online relay client (PMRELAY1, contract in tools/relay/RELAY_PROTOCOL.md).
-// Instead of listening on :7820 and hoping the player's router and firewall
-// cooperate, both sides dial OUT to a neutral relay that splices their streams:
-// no port forwarding, and neither player sees the other's IP.  After the short
-// ASCII handshake the socket is byte-for-byte a LAN socket, so everything below
-// this layer (framing, roles, host relay of client bundles) is untouched.
-//
-//   host:   control connection  "PMRELAY1 HOST <ver> <name>"  -> "OK <CODE>",
-//           then "JOIN <ticket>" / "PING" for the session's life; each ticket
-//           gets a fresh accept connection that lands in a normal peer slot.
-//   joiner: "PMRELAY1 JOIN <CODE> <ver> <name>" -> "OK", and that same socket
-//           IS the host link.
-//
-// Env harness (see RELAY_PROTOCOL.md): MELONDS_AP_RELAY=<host[:port]> turns
-// MELONDS_AP=host|join into an online session, MELONDS_AP_CODE=<code> joins a
-// known room, MELONDS_AP_CODEFILE=<path> lets the host publish its code to a
-// file that a joiner polls.  Without MELONDS_AP_RELAY nothing changes.
-// ---------------------------------------------------------------------------
+// Online relay client (PMRELAY1): both sides dial out and the relay splices them into a normal game stream.
 const int RELAY_PORT = MpOnlineDefaultPort;
 const melonDS::u32 RELAY_RETRY_MS = 6000;    // protocol floor is 5 s
 const melonDS::u32 RELAY_HS_MS = 20000;      // no reply to a hello: redial
 const melonDS::u32 RELAY_MAXLINE = 200;
 
-// UI handoff.  The Qt thread posts a request and polls the status; the
-// emulation thread consumes the request in its bridge pump and republishes the
-// status there.  Both are tiny, so one mutex costs nothing.
+// UI handoff: the Qt thread posts a request and reads status; the emulation thread serves both.
 std::mutex gUiMx;
 struct UiRequest
 {
@@ -701,9 +193,7 @@ void setNonBlock(SOCKET s)
 
 enum { RL_DEAD = 0, RL_CONNECTING, RL_HANDSHAKE, RL_UP };
 
-// One outbound relay connection during (and just after) its handshake.  All
-// three connection types share it; the joiner and accept links hand their
-// socket AND their leftover bytes to a peer slot the moment "OK" lands.
+// One outbound relay connection during its handshake.
 struct RelayLink
 {
     SOCKET s = INVALID_SOCKET;
@@ -724,8 +214,7 @@ struct RelayLink
         return std::find(in.begin(), in.end(), (melonDS::u8)'\n') != in.end();
     }
 
-    // Hands the live socket to a peer slot: this link goes dead WITHOUT
-    // closing it.  Copy `in` out first (leftover-buffer rule).
+    // Hand the live socket to a peer slot without closing it; copy `in` out first.
     SOCKET release() { SOCKET r = s; s = INVALID_SOCKET; close(); return r; }
 
     bool begin(const sockaddr_in& addr, const char* hello, melonDS::u32 nowMs)
@@ -743,8 +232,7 @@ struct RelayLink
         return true;
     }
 
-    // false = the link died; the caller decides retry vs terminal.  Bounded
-    // per-frame work, never blocks (the emulation thread runs this).
+    // false = the link died. Never blocks.
     bool pump()
     {
         if (st == RL_DEAD) return false;
@@ -780,20 +268,12 @@ struct RelayLink
                 break;
             }
         }
-        // A terminal "ERR <token>" and the close that follows it routinely land
-        // in ONE segment.  Reporting the link dead here, before the caller has
-        // read that line, would turn every terminal error into a plain dropout
-        // and retry forever against a room that will never exist.  Hold the
-        // death back until the buffer has no complete line left.
+        // Report death only after buffered lines are read (the relay sends ERR and closes together).
         if (closed && !hasLine()) return false;
         return true;
     }
 
-    // Pops one '\n'-terminated reply line.  Bytes past that '\n' STAY in `in`:
-    // on a joiner or accept link they are the first game-stream bytes (the
-    // relay's OK and the host's opening frame routinely share one segment) and
-    // the caller must carry them into the peer receive buffer.  Dropping them
-    // corrupts the very first length-framed frame.
+    // Pop one reply line. Bytes after it stay in `in`: they are game data for the peer buffer.
     bool takeLine(std::string& line)
     {
         for (size_t i = 0; i < in.size(); i++)
@@ -815,8 +295,7 @@ struct RelayLink
     }
 };
 
-// Retry policy from the protocol doc: these are the player's problem, not a
-// transient, so we stop and say why instead of hammering the relay.
+// Errors the player must fix: stop instead of retrying.
 bool relayErrTerminal(const char* tok)
 {
     return !strcmp(tok, "NOROOM") || !strcmp(tok, "VERSION")
@@ -836,14 +315,7 @@ const char* relayErrText(const char* tok)
 }
 
 #ifdef _WIN32
-// Windows Firewall helper for hosting (same scheme as the DeSmuME fork's
-// mp_bridge.cpp).  Router port-forwarding alone can't make a host reachable:
-// inbound traffic must also pass this PC's own firewall, and declining the
-// first-launch security alert leaves a permanent block rule for the exe.
-// A melonDS host needs BOTH its native LAN port (UDP 7064 + discovery) and
-// the bridge port (TCP 7820) open, so the rule is program-scoped.  When our
-// rule is absent we ASK the player, then run the standard netsh repair
-// visibly with one admin prompt.
+// Hosting needs an inbound firewall rule; if ours is missing we ask, then add it with one admin prompt.
 const wchar_t* FW_RULE = L"melonDS (Project PM)";
 
 static void fwLower(std::wstring& s)
@@ -889,7 +361,6 @@ static void ensureFirewall()
     static bool once = false;
     if (once) return;
     once = true;
-    if (getenv("MELONDS_AP")) return;   // automated harness instances: no prompts
 
     wchar_t exe[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -925,8 +396,7 @@ struct Peer
 {
     SOCKET s = INVALID_SOCKET;
     bool up = false;
-    bool reserved = false;      // online host: an accept connection is in flight
-                                // for this slot, so a second ticket picks another
+    bool reserved = false;      // online host: an accept connection is in flight for this slot
     std::vector<melonDS::u8> rx, tx;
 };
 
@@ -936,12 +406,9 @@ struct Net
     char joinIP[64] = "127.0.0.1";
     bool started = false;
     SOCKET listener = INVALID_SOCKET;
-    Peer peers[7];                      // host: 7 client slots (slot i = role 2+i; 8-player rooms)
-                                        // join: peers[0] = host link
+    Peer peers[7];                      // host: slot i = role 2+i; join: peers[0] = host link
     bool connecting = false;
-    bool freshPeer = false;     // link just came up: pump resends on-change
-                                // channels (party/pkt) — a peer connecting
-                                // after our first send never got our party
+    bool freshPeer = false;     // link just came up: resend party/pkt next pump
     melonDS::u32 retryAt = 0;
     int assignedRole = 0;               // join: role handed out by the host
 
@@ -951,25 +418,17 @@ struct Net
     char relaySrv[96] = "";             // "host:port" as the player typed it
     char roomCode[8] = "";              // host: assigned by the relay; join: target
     char lobbyName[40] = "Player";
-    char codeFile[512] = "";
     char onlineMsg[128] = "";           // connection state / last error, for the UI
     bool onlineFatal = false;           // terminal error: stop, do not hammer the relay
     melonDS::u32 onlineRetryMs = 0;
     melonDS::u32 onlineLogMs = 0;
     melonDS::u32 ctlSeenMs = 0;         // last line from the relay control link
-    bool codeWait = false;              // joiner: polling MELONDS_AP_CODEFILE
-    melonDS::u32 codePollMs = 0;
     RelayLink ctl;                      // host control connection
     RelayLink jlink;                    // joiner connection (becomes peers[0])
     struct AcceptLink { RelayLink l; int slot = -1; int ticket = 0; };
     AcceptLink acc[7];
 
-    // ---- lobby control frames (shared with the DeSmuME and BizHawk forks) ----
-    //   name: [0xFE][role][ping u16 LE][len u8][name]   ping: [0xFD][role][tick u32 LE]
-    //   pong: [0xFC][role][tick u32 LE]  (the receiver echoes a ping straight back)
-    // These ride the same length-framed stream as the game bundles but carry no
-    // game data, so they flow from the moment a link comes up: the roster is
-    // known in the lobby, long before anyone activates Wireless Play.
+    // Lobby frames: name [0xFE][role][ping u16][len][name], ping [0xFD][role][tick u32], pong [0xFC] likewise.
     char myName[24] = "Player";
     bool nameSet = false;
     char rname[9][24] = {{0}};          // display name by role (1..8)
@@ -979,11 +438,6 @@ struct Net
     melonDS::u32 pongRx = 0;            // pongs the host answered
     melonDS::u32 lastNameF = 0, lastPingF = 0;
     melonDS::u32 lobbySeen[9] = {0};    // LOBBY presence, by role.
-                                    // Deliberately NOT the ROM-visible peer mask:
-                                    // gBr.roleSeenAt stays game-bundle-only, so a
-                                    // peer idling in the lobby cannot make the game
-                                    // flash "wireless connected" (the two-tier split
-                                    // the DeSmuME bridge documents).
 
     int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
     // Host: slot i may only speak as role 2+i. Joiners trust the host's relay.
@@ -1003,8 +457,6 @@ struct Net
     {
         if (nameSet) return;
         nameSet = true;
-        const char* e = getenv("MELONDS_AP_NAME");
-        if (e && e[0]) { setStr(myName, e); return; }
         char nm[24]; DWORD n = 24;
         if (GetComputerNameA(nm, &n)) setStr(myName, nm);
     }
@@ -1035,10 +487,7 @@ struct Net
         enqueue(0, buf, 6);
     }
 
-    // Handles the control frames and says whether it swallowed one.  Callers
-    // MUST consult this before the game-bundle path: a name frame reaching that
-    // path would be read as tag 0xFE with the ping bytes as its size and would
-    // stamp the peer game-active from the lobby.
+    // Handles control frames; true = consumed. Call before the game-bundle path.
     bool handleCtlFrame(int pi, const melonDS::u8* rx, melonDS::u32 n, int role)
     {
         if (n == 2 && rx[0] == 0xFF)                    // host-assigned role
@@ -1088,8 +537,7 @@ struct Net
                     printf("[BR] lobby name: role %d = \"%s\" (ping %u ms)\n", r, rname[r], png);
                     fflush(stdout);
                 }
-                // Host relay: a client's name reaches only us, so pass it on or
-                // the other clients never learn who else is in the room.
+                // Host relay: pass a client's name on to the other clients.
                 if (myRole() == 1)
                     for (int pj = 0; pj < 7; pj++)
                         if (pj != pi) enqueue(pj, rx, n);
@@ -1111,11 +559,7 @@ struct Net
         return n;
     }
 
-    // Lobby-level drain, run every frame from tick().  The ROM-side pump only
-    // runs once the ROM has published its bridge block (title screen: never), so
-    // without this the roster and the role assignment would wait on the game.
-    // Stops at the first game bundle: those belong to the ROM pump, which
-    // handles control frames too once it is running.
+    // Drain control frames every frame, even before the ROM is up; stops at the first game bundle.
     void drainControl(int pi)
     {
         for (int guard = 0; guard < 32; guard++)
@@ -1131,9 +575,7 @@ struct Net
         }
     }
 
-    // Announce our name twice a second while linked, and (as a client) measure
-    // the ping to the host on the same cadence.  Cheap, and it keeps a roster
-    // fresh across reconnects without any join/leave bookkeeping.
+    // Send our name twice a second; clients also ping the host.
     void lobbyTick(melonDS::u32 frame)
     {
         for (int i = 0; i < 7; i++) drainControl(i);
@@ -1178,9 +620,7 @@ struct Net
         mode = 2; started = true;
     }
 
-    // Online host.  Deliberately does NOT bind, listen, beacon or touch the
-    // firewall helper: this session is outbound-only, so an inbound rule would
-    // buy nothing and a LAN advert would point peers at a port nobody serves.
+    // Online host: outbound only, so no listener, beacon or firewall prompt.
     void startHostOnline(const sockaddr_in& addr, const char* disp, const char* name)
     {
         WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
@@ -1208,11 +648,9 @@ struct Net
         onlineFatal = false; onlineRetryMs = 0;
         roomCode[0] = 0;
         if (code && code[0]) { setStr(roomCode, code); upperCode(); }
-        codeWait = !roomCode[0];
-        codePollMs = 0;
-        setMsg(codeWait ? "waiting for the host's room code" : "connecting...");
+        setMsg("connecting...");
         printf("[BR] online join: relay %s, room %s, name \"%s\"\n",
-            relaySrv, roomCode[0] ? roomCode : "(from code file)", lobbyName);
+            relaySrv, roomCode, lobbyName);
         fflush(stdout);
     }
 
@@ -1222,8 +660,7 @@ struct Net
             if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
     }
 
-    // LAN discovery beacon (UDP :7821, shared cross-emulator format) so a
-    // melonDS host also shows up in DeSmuME / BizHawk auto-find lists.
+    // LAN discovery beacon (UDP :7821), so DeSmuME and BizHawk can find a melonDS host.
     SOCKET beaconTx = INVALID_SOCKET;
     melonDS::u32 lastBeacon = 0;
     void beaconTick(melonDS::u32 frame, melonDS::u8 players)
@@ -1247,39 +684,6 @@ struct Net
         sendto(beaconTx, (const char*)buf, 32, 0, (sockaddr*)&a, sizeof(a));
     }
 
-    void startFromEnv()
-    {
-        started = true;
-        const char* e = getenv("MELONDS_AP");
-        if (!e) { mode = 0; return; }
-
-        // MELONDS_AP_RELAY turns the harness roles into an online session.
-        // Absent, everything below behaves exactly as it always has.
-        const char* relay = getenv("MELONDS_AP_RELAY");
-        if (relay && relay[0])
-        {
-            setStr(codeFile, getenv("MELONDS_AP_CODEFILE"));
-            const char* nm = getenv("MELONDS_AP_NAME");
-            MpOnlineTarget t;
-            if (!MpOnlineResolve(relay, RELAY_PORT, &t))
-            {
-                printf("[BR] online: cannot resolve relay \"%s\"\n", relay);
-                fflush(stdout);
-                mode = 0;
-                return;
-            }
-            sockaddr_in a; memcpy(&a, t.addr, sizeof(a));
-            if (!strcmp(e, "host")) startHostOnline(a, t.disp, nm);
-            else if (!strcmp(e, "join")) startJoinOnline(a, t.disp, getenv("MELONDS_AP_CODE"), nm);
-            else mode = 0;
-            return;
-        }
-
-        if (!strcmp(e, "host")) startHost();
-        else if (!strcmp(e, "join")) startJoin(getenv("MELONDS_AP_IP"));
-        else mode = 0;
-    }
-
     void dropPeer(int i)
     {
         Peer& p = peers[i];
@@ -1299,40 +703,7 @@ struct Net
 
     // ---- online relay state machines ---------------------------------------
 
-    void writeCodeFile()
-    {
-        if (!codeFile[0] || !roomCode[0]) return;
-        FILE* f = fopen(codeFile, "wb");
-        if (!f) { printf("[BR] online: cannot write code file %s\n", codeFile); fflush(stdout); return; }
-        fprintf(f, "%s\n", roomCode);
-        fclose(f);
-        printf("[BR] online: wrote code %s to %s\n", roomCode, codeFile);
-        fflush(stdout);
-    }
-
-    bool readCodeFile()
-    {
-        if (!codeFile[0]) return false;
-        FILE* f = fopen(codeFile, "rb");
-        if (!f) return false;
-        char b[32] = {0};
-        size_t n = fread(b, 1, sizeof(b)-1, f);
-        fclose(f);
-        char c[8]; size_t k = 0;
-        for (size_t i = 0; i < n && k < 5; i++)
-        {
-            char ch = b[i];
-            if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') continue;
-            c[k++] = (ch >= 'a' && ch <= 'z') ? (char)(ch - 'a' + 'A') : ch;
-        }
-        if (k < 5) return false;
-        c[5] = 0;
-        setStr(roomCode, c);
-        return true;
-    }
-
-    // Applies an "ERR <token>" reply.  Terminal tokens stop the session with a
-    // reason the player can act on; the rest get the >= 5 s backoff.
+    // Apply an "ERR <token>" reply: terminal ones stop the session, the rest back off and retry.
     void applyErr(const char* tok, melonDS::u32 now, const char* who)
     {
         char m[128];
@@ -1360,8 +731,7 @@ struct Net
             if (acc[i].l.st == RL_DEAD) { ai = i; break; }
         if (slot < 0 || ai < 0)
         {
-            // No free peer slot: leave the ticket unclaimed on purpose.  The
-            // relay expires it and tells that joiner TIMEOUT.
+            // No free slot: leave the ticket unclaimed so the relay times it out.
             printf("[BR] online host: ticket %d ignored, no free slot\n", tid);
             fflush(stdout);
             return;
@@ -1376,8 +746,7 @@ struct Net
         fflush(stdout);
     }
 
-    // Spliced: hand the socket to the peer slot exactly as accept() would have,
-    // leftover handshake bytes and role assignment frame included.
+    // Spliced: install the socket in the peer slot like an accepted LAN client, leftover bytes included.
     void installLink(RelayLink& l, int i)
     {
         Peer& p = peers[i];
@@ -1455,8 +824,7 @@ struct Net
         bool bad = !ctl.pump() || ctl.overflow();
         bool said = false;      // an ERR reply already explained itself
         if (!bad && ctl.st != RL_UP && now - ctl.startMs > RELAY_HS_MS) bad = true;
-        // The relay pings every 30 s; prolonged silence means the room is gone
-        // even though the socket still looks alive (joiners would just time out).
+        // the relay pings every 30 s, so long silence means the room is gone
         if (!bad && ctl.st == RL_UP && now - ctlSeenMs > 120000) bad = true;
         std::string line;
         while (!bad && ctl.takeLine(line))
@@ -1473,7 +841,6 @@ struct Net
                 setMsg(m);
                 printf("[BR] online room code %s on %s\n", roomCode, relaySrv);
                 fflush(stdout);
-                writeCodeFile();
             }
             else if (!strcmp(v, "JOIN")) startAccept(atoi(t), now);
             else if (!strcmp(v, "PING")) ctl.out += "PONG\n";
@@ -1500,16 +867,6 @@ struct Net
 
     void joinOnlineTick(melonDS::u32 now)
     {
-        if (codeWait)
-        {
-            if (now < codePollMs) return;
-            codePollMs = now + 1000;            // about once a second
-            if (!readCodeFile()) return;
-            codeWait = false;
-            setMsg("connecting...");
-            printf("[BR] online join: room code %s read from %s\n", roomCode, codeFile);
-            fflush(stdout);
-        }
         if (peers[0].up) return;                // spliced: normal joiner behaviour
 
         if (jlink.st == RL_DEAD)
@@ -1572,14 +929,11 @@ struct Net
         if (online == 1) hostOnlineTick(now);
         else if (online == 2) joinOnlineTick(now);
 
-        // Low-rate liveness line: the lobby state is worth seeing even before
-        // the ROM publishes its bridge block (which gates the pump's own log).
+        // Periodic lobby status line.
         if (now - onlineLogMs >= 10000)
         {
             onlineLogMs = now;
-            // A joiner that has not reached the ROM's bridge block yet still
-            // holds the host's role frame in its receive buffer; show it, so
-            // "the host assigned me role N" is visible at lobby level too.
+            // show a role frame still waiting in the receive buffer
             const Peer& p0 = peers[0];
             int pendRole = (online == 2 && p0.rx.size() >= 4
                 && p0.rx[0] == 2 && p0.rx[1] == 0 && p0.rx[2] == 0xFF) ? p0.rx[3] : 0;
@@ -1613,8 +967,7 @@ struct Net
         }
     }
 
-    // Picks up a start/stop request posted by the Qt thread.  Runs before the
-    // LAN-follow logic, so an online session always wins while it is active.
+    // Pick up a start/stop request from the Qt thread. Runs before LAN-follow, so online wins.
     void pollRequest()
     {
         UiRequest r;
@@ -1741,7 +1094,7 @@ struct Net
         if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
         ctl.close(); jlink.close();
         for (int i=0;i<7;i++) { acc[i].l.close(); acc[i].slot = -1; acc[i].ticket = 0; }
-        roomCode[0] = 0; onlineFatal = false; onlineRetryMs = 0; codeWait = false;
+        roomCode[0] = 0; onlineFatal = false; onlineRetryMs = 0;
         assignedRole = 0;
         mode = 0;
     }
@@ -1788,13 +1141,9 @@ void BridgePump(melonDS::NDS* nds)
     gBr.frame++;
 
     mpnet::gNet.pollRequest();      // Host/Join Online Game... from the menu
-    if (!mpnet::gNet.started) mpnet::gNet.startFromEnv();
     if (mpnet::gNet.mode == 0)
     {
-        // No env config (a real player): follow the melonDS LAN lobby the
-        // player used.  Hosting a LAN game starts the TCP bridge host;
-        // joining one connects the bridge to the lobby host IP.  The ENet
-        // session is left alone; the bridge rides alongside on :7820.
+        // No env config: follow the melonDS LAN lobby (host starts the bridge host, joiner connects to the lobby host).
         if (MPInterface::GetType() == MPInterface_LAN)
         {
             LAN& lan = (LAN&)MPInterface::Get();
@@ -1818,9 +1167,7 @@ void BridgePump(melonDS::NDS* nds)
     }
     mpnet::gNet.tick(gBr.frame);
 
-    // A peer link just came up: drop the on-change send caches so the next
-    // pump resends party/pkt — a peer connecting AFTER our first send never
-    // received our party (battle/trade launch waits on it forever).
+    // A peer link just came up: clear the send caches so party/pkt are resent.
     if (mpnet::gNet.freshPeer)
     {
         mpnet::gNet.freshPeer = false;
@@ -1867,12 +1214,7 @@ void BridgePump(melonDS::NDS* nds)
         && gBr.partySize != 0 && gBr.partySize <= 2048
         && gBr.pktSize != 0 && gBr.pktSize <= 2048);
 
-    // NO early-return when !inGame: the old return left inbound frames
-    // QUEUED in the peer rx vectors (1MB cap -> DropPeer after ~80s of
-    // pre-activation idling) and never applied the peer's one-shot
-    // on-change party send if they activated before us.  Drain + apply
-    // ALWAYS (the mailboxes are inert BSS until the ROM activates); only
-    // the outbound bundles and the status/peerMask writes gate on inGame.
+    // No early return when not in game: frames must still be drained and applied.
     if (!inGame)
     {
         apWr8(nds, gBr.ctl + 7, 0);
@@ -1925,10 +1267,7 @@ void BridgePump(melonDS::NDS* nds)
         while ((n = mpnet::gNet.recvFrame(pi, rx, sizeof(rx))) > 0)
         {
             gBr.dbgRx++;
-            // Control frames (role, lobby name, ping/pong) never carry game
-            // data and must be taken out BEFORE the bundle path below, which
-            // would otherwise read a name frame's ping bytes as a block size
-            // and stamp that peer game-active from the lobby.
+            // Take control frames out before the bundle path.
             if (mpnet::gNet.handleCtlFrame(pi, rx, n, myRole)) continue;
             if (n < 4) continue;
             int tag = rx[0], r = rx[1];
@@ -1937,57 +1276,36 @@ void BridgePump(melonDS::NDS* nds)
             if (!mpnet::gNet.roleAllowed(pi, r)) continue;
             if (n < 4 + sz) continue;
 
-            // Host relay: a client bundle reaches only the host — forward it to
-            // the other clients so everyone sees everyone (origin drops its own
-            // echo via r == myRole).
+            // Host relay: forward each client's bundle to the other clients.
             if (myRole == 1)
                 for (int pj = 0; pj < 7; pj++)
                     if (pj != pi) mpnet::gNet.enqueue(pj, rx, n);
 
             if (tag >= 1 && tag <= 3)
             {
-                // Peer NEWLY game-active (activated Wireless Play or
-                // reconnected): resend on-change channels — anything sent
-                // before this moment predated their readiness.
+                // Peer newly in game: resend our party/pkt.
                 bool wasFresh = gBr.roleSeenAt[r] != 0 && gBr.frame - gBr.roleSeenAt[r] <= 180;
                 if (!wasFresh)
                 {
                     gBr.lastParty.clear();
                     gBr.lastPkt.clear();
                 }
-                // Game-bundle presence ONLY: the ROM-visible peer mask must not
-                // count a player who is merely sitting in the lobby.
+                // game presence only: lobby idlers do not count
                 gBr.roleSeenAt[r] = gBr.frame;
                 sGameEver[r] = 1;   // latch: role has been game-active this session
             }
 
-            // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
-            // import block / party buffer only accepts the CHOSEN pair
-            // partner's data (ROM publishes intent at OW export +0x18;
-            // 0 = unpaired keeps first-come behaviour).  Without this every
-            // peer's bundle overwrote the legacy block and battle/trade/give
-            // requests "broadcast" to every player.  Per-role arrays always
-            // update.
+            // The pairwise import only takes the chosen partner (pairRole at OW export +0x18).
             if (tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
-                // STRICT 3+ ROUTING (4P same-trainer fix, ported from the
-                // DeSmuME bridge): with two or more fresh peers the legacy
-                // pairwise import only accepts the CHOSEN partner — the old
-                // "pairRole 0 accepts everyone, last writer wins" open door
-                // let a mid-battle pair's per-turn broadcasts (same
-                // trainerHash) hijack a still-unpaired third player's entry
-                // stall.  Unpaired in 3+ receives nothing and keeps waiting
-                // for the real partner; plain 2P keeps the open door.
+                // With 2+ game peers the pairwise import is strict: only the chosen partner, never "first come".
                 melonDS::u8 pairRole = apRd8(nds, gBr.owExp + 0x18);
-                // Ever-game-active latch, NOT recent traffic: mid-battle
-                // peers freeze their exports and an aging count re-opened
-                // the legacy door exactly while a pair fought (4P bug).
+                // count peers that were ever in game, not recent traffic
                 int gamePeers = 0;
                 for (int gr = 1; gr <= 8; gr++)
                     if (gr != myRole && sGameEver[gr]) gamePeers++;
                 bool strict = (gamePeers >= 2);
-                rx[4 + 0x12] = (melonDS::u8)r;   // stamp playerRole (old-hub duty;
-                                                 // MpPartnerIsLead dead without it)
+                rx[4 + 0x12] = (melonDS::u8)r;   // stamp the sender's role into the block
                 if ((pairRole == 0 && !strict) || r == (int)pairRole)
                     memcpy(apPtr(nds, gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(nds, gBr.blkN + (r-1)*sz), rx + 4, sz);
@@ -1996,9 +1314,7 @@ void BridgePump(melonDS::NDS* nds)
             else if (tag == 2 && sz == gBr.partySize)
             {
                 melonDS::u8 pairRole = apRd8(nds, gBr.owExp + 0x18);
-                // Ever-game-active latch, NOT recent traffic: mid-battle
-                // peers freeze their exports and an aging count re-opened
-                // the legacy door exactly while a pair fought (4P bug).
+                // count peers that were ever in game, not recent traffic
                 int gamePeers = 0;
                 for (int gr = 1; gr <= 8; gr++)
                     if (gr != myRole && sGameEver[gr]) gamePeers++;
@@ -2015,15 +1331,7 @@ void BridgePump(melonDS::NDS* nds)
         }
     }
 
-    // PAIR REBIND / GHOST PURGE (ported from the DeSmuME bridge).  On a
-    // pairRole change to a REAL role, replay that role's latest cached
-    // block/party from the always-updated per-role arrays.  A change to 0
-    // is left ALONE: the ROM's pair re-validate briefly flaps pairRole to 0
-    // when the partner's conversion window closes and re-courts mutually the
-    // next scan tick -- zeroing here killed the P3+P4 conversion
-    // mid-handshake.  The stale ex-partner hazard is handled where it bites:
-    // when OUR OWN battle ends (export inBattle 1->0) the import's magic
-    // dies, so a frozen mid-battle partner block can't convert a later one.
+    // pairRole changed to a real role: replay that role's cached block and party. A change to 0 is ignored (it flaps).
     if (gBr.owExp && gBr.importBlk)
     {
         static melonDS::u8 sLastPairRole = 0xFF;
@@ -2062,10 +1370,7 @@ void BridgePump(melonDS::NDS* nds)
         fflush(stdout);
     }
 
-    // ALWAYS-ON crash catcher: if the game's overworld frame counter stops
-    // while a bridge session is active, the ARM9 is wedged/crashed — record
-    // its registers so the faulting site can be mapped, regardless of how
-    // this instance was launched.
+    // Crash catcher: overworld frame counter frozen during a session, so dump the ARM9 registers.
     {
         static melonDS::u32 ccLastFC = 0, ccChangedAt = 0;
         static int ccDumped = 0;
@@ -2107,9 +1412,7 @@ void BridgePump(melonDS::NDS* nds)
         }
     }
 
-    // status + peer mask (freshness: a bundle from that role within ~3 s).
-    // Only while OUR session is active — pre-activation the ROM must keep
-    // seeing "searching", and the !inGame branch above wrote 0s already.
+    // Status + peer mask, only while our session is active.
     if (inGame)
     {
         u8 mask = gBr.FreshPeerMask(myRole);
@@ -2123,15 +1426,11 @@ void BridgePump(melonDS::NDS* nds)
 // ---------------------------------------------------------------------------
 
 
-// ---------------------------------------------------------------------------
-// Online relay control surface (MpOnline.h).  Called from the Qt thread; the
-// emulation thread picks the request up in its next bridge pump.
-// ---------------------------------------------------------------------------
+// Online relay control surface (MpOnline.h): called from the Qt thread, served by the next bridge pump.
 
 int MpOnlineWireVersion() { return (int)mpnet::WIREVER; }
 
-// Blocking DNS, on purpose: it runs once at click time (or once at env init),
-// never inside the frame loop.
+// Blocking DNS: runs once at click time or env init, never per frame.
 bool MpOnlineResolve(const char* server, int defPort, MpOnlineTarget* out)
 {
     if (!server || !out) return false;
@@ -2213,10 +1512,6 @@ void MpOnlineGetStatus(MpOnlineStatus* out)
 
 void EmuThread::run()
 {
-    {
-        const char* ap = getenv("MELONDS_AP");
-        if (ap) MpWatchdogStart(ap);
-    }
     Config::Table& globalCfg = emuInstance->getGlobalConfig();
     u32 mainScreenPos[3];
 
@@ -2365,7 +1660,7 @@ void EmuThread::run()
 
             // process input and hotkeys
             BridgePump(emuInstance->nds);
-            emuInstance->nds->SetKeyMask(apApply(emuInstance->nds, emuInstance->inputMask));
+            emuInstance->nds->SetKeyMask(emuInstance->inputMask);
 
             if (emuInstance->isTouching)
                 emuInstance->nds->TouchScreen(emuInstance->touchX, emuInstance->touchY);

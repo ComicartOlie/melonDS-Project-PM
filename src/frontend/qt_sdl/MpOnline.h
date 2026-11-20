@@ -16,20 +16,7 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-// ---------------------------------------------------------------------------
-// Project PM online relay (PMRELAY1) control surface.
-//
-// The relay transport itself lives with the rest of the fork bridge in
-// EmuThread.cpp; this is the small thread-safe surface the Qt UI uses to start
-// an online session and to display its state.  Nothing here pulls in winsock,
-// so Qt sources can include it freely: the resolved relay address travels as
-// opaque bytes.
-//
-// Threading: MpOnlineResolve() blocks (DNS) and must be called from the UI
-// thread at click time, never from the emulation thread's frame loop.  The
-// start/stop calls only post a request; the emulation thread picks it up on
-// its next bridge pump.
-// ---------------------------------------------------------------------------
+// Online relay (PMRELAY1) control surface for the Qt UI. No winsock here; the transport lives in EmuThread.cpp.
 
 #ifndef MPONLINE_H
 #define MPONLINE_H
@@ -51,8 +38,7 @@ struct MpOnlineStatus
     char server[96] = "";
     char text[128] = "";            // connection state / last error, for the UI
 
-    // Lobby roster, indexed by role 1..8 (slot 0 unused).  Names arrive over
-    // the shared 0xFE frame, so they are known before anyone starts playing.
+    // Lobby roster by role 1..8 (slot 0 unused).
     char roster[9][24] = {};
     int rosterPing[9] = {};         // that player's ping to the host, ms
     int myRole = 0;
@@ -74,9 +60,7 @@ int MpOnlineWireVersion();
 // Default relay port when the player types a bare host name.
 const int MpOnlineDefaultPort = 7833;
 
-// The community relay, pre-filled into the online dialogs so players never
-// have to type an address.  A relay saved in the config always wins over this,
-// and the env-var harness is unaffected: it still requires MELONDS_AP_RELAY.
+// Community relay pre-filled in the online dialogs; a saved custom value wins.
 const char* const MpOnlineDefaultRelay = "193.122.236.144:7833";
 
 #endif // MPONLINE_H

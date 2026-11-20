@@ -688,27 +688,15 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
 
     show();
 
-    // Multi-instance: separate PROCESSES each think they are instance 0
-    // (melonDS instance ids are per-process), so both restore the same
-    // saved geometry and stack exactly on top of each other.  Detect a
-    // second process via a cross-process marker (or the harness env) and
-    // offset it to the RIGHT, post-show (pre-show moves get overridden).
+    // A second melonDS process restores the same geometry: move it to the right after showing.
     {
         int slot = 0;
-        const char* ap = getenv("MELONDS_AP");
-        if (ap && !strcmp(ap, "join"))
+        static QSharedMemory* firstWinClaim = nullptr;
+        if (!firstWinClaim)
         {
-            slot = 1;
-        }
-        else if (!ap)
-        {
-            static QSharedMemory* firstWinClaim = nullptr;
-            if (!firstWinClaim)
-            {
-                firstWinClaim = new QSharedMemory("melonDS-first-window-claim");
-                if (!firstWinClaim->create(1))
-                    slot = 1;   // another process already owns the spot
-            }
+            firstWinClaim = new QSharedMemory("melonDS-first-window-claim");
+            if (!firstWinClaim->create(1))
+                slot = 1;   // another process already owns the spot
         }
         if (slot > 0)
         {
@@ -1813,17 +1801,9 @@ void MainWindow::onLANStartClient()
     LANStartClientDialog::openDlg(this);
 }
 
-// ---------------------------------------------------------------------------
-// Online relay lobby (PMRELAY1).  Both sides dial OUT to a neutral relay that
-// splices their streams: no port forwarding, no router setup, and neither
-// player ever sees the other's IP.  LAN hosting and direct IP joining are
-// untouched; this is a separate path that does not use melonDS's own LAN
-// session at all.
-// ---------------------------------------------------------------------------
+// Online relay lobby (PMRELAY1). Separate from melonDS's own LAN session.
 
-// Pre-set to the community relay so a player never has to type an address.
-// Anything they saved earlier wins, which is what keeps self-hosted relays
-// sticky once they have been used.
+// Default to the community relay; a saved custom value wins.
 QString MainWindow::onlineRelayServer()
 {
     QString s = globalCfg.GetQString("Online.RelayServer").trimmed();
@@ -1839,11 +1819,7 @@ QString MainWindow::onlineDefaultName()
     return n;
 }
 
-// Persist the relay ONLY when it is genuinely custom.  Writing the baked
-// default into the config would pin this player to today's address: a future
-// default shipped in a later build would be shadowed by their saved copy
-// forever.  Storing nothing keeps them following whatever the build defaults
-// to, and un-pins anyone an earlier build already pinned.
+// Save only a custom relay; storing the default would shadow future defaults.
 void MainWindow::onlineSaveRelay(const QString& srv)
 {
     if (srv == QString(MpOnlineDefaultRelay))
@@ -1863,8 +1839,7 @@ void MainWindow::onOnlineStartHost()
     QDialog dlg(this);
     dlg.setWindowTitle("Host Online Game");
 
-    // The relay box appears only for players who turned on Custom Relay Server.
-    // By default hosting is just: type a name, get a code.
+    // The relay box shows only when Custom Relay Server is on.
     bool custom = globalCfg.GetBool("Online.ShowRelayServer");
 
     QFormLayout* form = new QFormLayout(&dlg);
@@ -1998,10 +1973,7 @@ void MainWindow::showOnlineStatus()
     {
         onlineStatusDlg = new QDialog(this);
         onlineStatusDlg->setWindowTitle("Online Game");
-        // A parented QDialog has no minimize box and no taskbar entry, so the
-        // online status window could only be closed, never minimized (unlike
-        // the LAN dialog).  Promote it to a real top-level window with the
-        // minimize + close hints so it behaves like every other window.
+        // Make it a real top-level window so it can be minimized.
         onlineStatusDlg->setWindowFlags(Qt::Window
             | Qt::CustomizeWindowHint | Qt::WindowTitleHint
             | Qt::WindowMinimizeButtonHint | Qt::WindowCloseButtonHint);
@@ -2072,8 +2044,7 @@ void MainWindow::updateOnlineStatus()
     }
     if (st.pending) s += "\nStarting: waiting for emulation to run.";
 
-    // Roster: names arrive over the shared lobby frame, so players show up here
-    // as soon as they connect, well before anyone starts playing.
+    // Roster: names arrive as soon as players connect.
     QString roster;
     for (int r = 1; r <= 8; r++)
     {
